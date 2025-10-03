@@ -30,6 +30,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.worker_base import WorkerBase
 
 logger = init_logger(__name__)
+req2free_block_ids: dict[str, list[int]] = {}
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -186,7 +187,7 @@ class Worker(WorkerBase):
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
-        """Profiles the peak memory usage of the model to determine how much 
+        """Profiles the peak memory usage of the model to determine how much
         memory can be used for KV cache without OOMs.
 
         The engine will first conduct a profiling of the existing memory usage.
@@ -293,6 +294,12 @@ class Worker(WorkerBase):
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
+
+    def pass_req2free_block_ids(self, req2free_block_ids_input: dict[str, list[int]]):
+        import copy
+        global req2free_block_ids
+        req2free_block_ids = copy.deepcopy(req2free_block_ids_input)
+        logger.info(f"req2free_block_ids_input is: {req2free_block_ids_input}, global req2free_block_ids is: {req2free_block_ids}")
 
     @torch.inference_mode()
     def execute_model(

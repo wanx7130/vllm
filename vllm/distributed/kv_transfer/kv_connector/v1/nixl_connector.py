@@ -205,13 +205,13 @@ class NixlConnectorScheduler:
         """
         For remote prefill, pull all prompt blocks from remote
         asynchronously relative to engine execution.
-        
+
         Args:
             request (Request): the request object.
             num_computed_tokens (int): the number of locally
                 computed tokens for this request
         Returns:
-            * the number of tokens that can be loaded from the 
+            * the number of tokens that can be loaded from the
               external KV cache beyond what is already computed.
             * true if the external KV cache tokens will be loaded
               asynchronously (between scheduler steps).
@@ -370,6 +370,7 @@ class NixlConnectorWorker:
         self.tp_group = get_tp_group()
 
         # KV Caches and nixl tracking data.
+        self.req2block: dict[str, list[int]] = {}
         self.kv_caches: dict[str, torch.Tensor] = {}
 
         # Map of engine_id -> kv_caches_base_addr. For TP case, each local
@@ -687,14 +688,14 @@ class NixlConnectorWorker:
         blocks from remote.
 
         In particular, handle both homogeneous and heterogeneous TP. The former
-        requires local rank_i to read from remote rank_i. 
-        The latter, assuming D.world_size > P.world_size, requires that two or 
+        requires local rank_i to read from remote rank_i.
+        The latter, assuming D.world_size > P.world_size, requires that two or
         more local TP worker share the xfer from a single TP worker.
 
         Here's an example:
 
         rank_offset     p_remote_tp_rank
-        (kv split no)    
+        (kv split no)
         --------------------------------
             0                 0      Worker0  ---- 1st half of KV ----> Worker0  [ KV Cache ]
                                                                         /
@@ -707,14 +708,14 @@ class NixlConnectorWorker:
 
                                 Decoder TP workers                     Prefix TP workers
                                   (world_size=4)                         (world_size=2)
-                                                 tp_ratio = 4 // 2 = 2                  
-                                
-        Considering the KV Caches, if P-Worker_i has cache size [2, num_blocksP, kv_heads, block_size, head_dim]  
+                                                 tp_ratio = 4 // 2 = 2
+
+        Considering the KV Caches, if P-Worker_i has cache size [2, num_blocksP, kv_heads, block_size, head_dim]
         then D-Worker_j has [2, num_blocksD, kv_heads//tp_ratio, block_size, head_dim]. Mind the "HND" layout format.
-        Assuming num_blocksD >= num_blocksP, D-Worker0 reads from P-Worker0 by preparing the kv_heads//tp_ratio 
+        Assuming num_blocksD >= num_blocksP, D-Worker0 reads from P-Worker0 by preparing the kv_heads//tp_ratio
         first heads from all the slots of all the blocks. D-Worker1 will do the same, but reading the second split
-        along the kv_heads dimension, and so forth until "tp_ratio" D TP workers have pulled from P-Worker0.   
-        
+        along the kv_heads dimension, and so forth until "tp_ratio" D TP workers have pulled from P-Worker0.
+
         Note that the above will also hold true for the homogeneous TP case, where tp_ratio evaluates to 1.
 
         Regarding MLA case, the cache is replicated across TP workers so the rank_offset will just always be 0
@@ -831,10 +832,37 @@ class NixlConnectorWorker:
 
         # Rank 0: get finished from all other ranks.
         if self.tp_rank == 0:
+            from vllm.v1.worker.gpu_worker import req2free_block_ids as global_req2free_block_ids
+            import json, os, time, pickle
+            import torch
+            # from safetensors import save_file, load_file
+            dump_dir = "./tmp/vllm_nixl_dump"
             for req_id in done_sending:
                 self._done_sending_count[req_id] += 1
+                # dump to debug
+                # global global_req2free_block_ids
+                if not os.path.isdir(dump_dir):
+                    os.makedirs(dump_dir, exist_ok=True)
+                logger.error("[wxl] rank %s start dump kvcache data of prefill req %s", self.tp_rank, req_id)
+                logger.error("[wxl] len of req2block: %s num_blocks: %s", global_req2free_block_ids[req_id], self.num_blocks)
+                for layer, t in self.kv_caches.items():
+                    tensors = torch.split(t, 1, dim=0)
+                    for bid in global_req2free_block_ids[req_id]:
+                        torch.save(tensors[bid].clone(), f"{dump_dir}/{req_id}_{layer}_{bid}_before.pt")
+
             for req_id in done_recving:
                 self._done_recving_count[req_id] += 1
+                # dump to debug
+                if not os.path.isdir(dump_dir):
+                    os.makedirs(dump_dir, exist_ok=True)
+                logger.error("[wxl] rank %s start dump kvcache data of decoder req %s", self.tp_rank, req_id)
+                logger.error("[wxl] len of req2block: %s num_blocks: %s", self.req2block[req_id], self.num_blocks)
+                for layer, t in self.kv_caches.items():
+                    logger.error("[wxl] layer %s t shape %s ", layer, t.shape)
+                    tensors = torch.split(t, 1, dim=0)
+                    logger.error("[wxl] len tesnors %s ", len(tensors))
+                    for bid in self.req2block[req_id]:
+                        torch.save(tensors[bid].clone(), f"{dump_dir}/{req_id}_{layer}_{bid}_after.pt")
 
             # Keep track of how many other ranks have finished.
             other_ranks_finished_ids: list[str] = []
@@ -1031,6 +1059,8 @@ class NixlConnectorWorker:
                 remote_block_descs_ids.extend(layer_remote_desc_ids)
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
+
+        self.req2block[request_id] = local_block_ids
 
         # Prepare transfer with Nixl.
         handle = self.nixl_wrapper.make_prepped_xfer(

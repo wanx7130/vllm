@@ -163,6 +163,11 @@ class MultiprocExecutor(Executor):
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS)
         return output
 
+    def pass_req2free_block_ids(self, req2free_block_ids: dict[str, list[int]]):
+        self.collective_rpc(
+            "pass_req2free_block_ids", args=(req2free_block_ids,)
+        )
+
     def collective_rpc(self,
                        method: Union[str, Callable],
                        timeout: Optional[float] = None,
